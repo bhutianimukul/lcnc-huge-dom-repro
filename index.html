@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Repro: Huge DOM + N-level nested iframes (Aw Snap / renderer OOM)</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 0; background: #fafafa; }
+  .repro-widget {
+    border: 1px solid #ddd; margin: 6px; padding: 8px; background: #fff;
+    box-shadow: 0 1px 2px rgba(0,0,0,.06); border-radius: 4px;
+  }
+  .repro-widget input, .repro-widget textarea, .repro-widget select { width: 100%; margin: 4px 0; }
+  iframe { width: 96%; height: 340px; border: 2px solid #c33; margin: 8px auto; display: block; }
+  h2 { background: #eee; padding: 8px; margin: 0; }
+  #hud {
+    position: fixed; top: 8px; right: 8px; z-index: 2147483647;
+    background: #111; color: #0f0; font: 12px monospace; padding: 10px;
+    border-radius: 6px; max-width: 360px; box-shadow: 0 2px 8px rgba(0,0,0,.4);
+  }
+  #hud button { font: 12px monospace; margin-top: 6px; cursor: pointer; }
+  #hud pre { margin: 6px 0 0; white-space: pre-wrap; color: #9cf; }
+
+  /* visually heavy payload: gradients + blur + shadows + conic gradients = expensive paint/compositing */
+  .vgrid { display: flex; flex-wrap: wrap; padding: 10px;
+    background: repeating-linear-gradient(45deg,#eee,#eee 12px,#e3e3e3 12px,#e3e3e3 24px); }
+  .vcard { display: inline-block; width: 300px; vertical-align: top; margin: 10px; padding: 12px;
+    border-radius: 16px; overflow: hidden;
+    background: linear-gradient(135deg,#ff9a9e,#fad0c4 30%,#a1c4fd 65%,#c2e9fb);
+    box-shadow: 0 12px 34px rgba(0,0,0,.28), inset 0 0 24px rgba(255,255,255,.45);
+    filter: saturate(1.35); }
+  .vcard img { width: 100%; height: 190px; object-fit: cover; border-radius: 12px;
+    filter: contrast(1.12) saturate(1.2) drop-shadow(0 8px 16px rgba(0,0,0,.45)); }
+  .vcard h3 { margin: 10px 0 4px; text-shadow: 1px 1px 2px rgba(0,0,0,.35); }
+  .vcard .swatch { height: 46px; margin-top: 8px; border-radius: 10px; filter: blur(7px);
+    background: conic-gradient(from 0deg,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00); }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div id="hud-cfg">building…</div>
+  <button id="measure-btn">Measure DOM payload (all frames)</button>
+  <pre id="hud-out"></pre>
+</div>
+
+<h1 style="padding:12px;">Huge-DOM renderer-OOM repro</h1>
+<p style="padding:0 12px;">Single scrollable page + a chain of same-origin nested iframes, each carrying a heavy DOM.
+Tune via URL query params (see console). Point the robust algorithm / recorder at
+<code>#deep-target</code> inside the innermost iframe.</p>
+
+<div id="main-content"></div>
+<h2>↓ Nested iframe chain (same-origin, walkable) ↓</h2>
+<div id="iframe-mount"></div>
+
+<script>
+// ponytail: pure repro harness. Counts are the knobs; defaults are heavy-but-survivable
+// so the PAGE builds, and the crash comes from whatever walks it (robust algo / recorder).
+// Scale up via query params until it "Aw Snap"s. No upgrade path — this is throwaway.
+(function () {
+  const q = new URLSearchParams(location.search);
+  const num = (k, d) => Math.max(0, parseInt(q.get(k) ?? d, 10) || d);
+  const cfg = {
+    widgets:  num('widgets', 800),   // heavy widgets on the MAIN page
+    depth:    num('depth', 10),      // iframe nesting levels
+    iwidgets: num('iwidgets', 300),  // heavy widgets inside EACH iframe level
+    attrs:    num('attrs', 25),      // data-* attributes per element (bloats outerHTML)
+    text:     num('text', 500),      // chars of text per text blob
+    spine:    num('spine', 12),      // wrapper-div nesting depth per frame (bloats xpath/cssPath)
+    mb:       num('mb', 40),         // target MINIMUM serialized DOM size per frame, in MB
+    imgpx:    num('imgpx', 640)      // noise-image resolution (px) — bigger = fatter data-URI + more GPU memory
+  };
+  // TOTAL serialized ≈ (depth + 1) × mb  →  default 11 × 40 = ~440 MB (well over 100 MB)
+  console.log('[repro] config', cfg,
+    '\nTotal serialized ≈ (depth+1)×mb MB.',
+    '\nExamples: ?mb=40&depth=10 (~440MB) | ?mb=110&depth=0 (>100MB, one page) | ?mb=80&depth=10 (~880MB, likely OOMs on build)');
+  document.getElementById('hud-cfg').textContent =
+    `mb/frame≥${cfg.mb} depth=${cfg.depth} widgets(main)=${cfg.widgets} iwidgets=${cfg.iwidgets}\nattrs=${cfg.attrs} text=${cfg.text} spine=${cfg.spine}`;
+
+  const LOREM = 'the quick brown fox jumps over the lazy dog while a huge dom slowly eats the renderer heap ';
+  // O(n) via repeat — generating hundreds of MB with string concat would hang.
+  const pad = (len) => (len <= 0 ? '' : LOREM.repeat(Math.ceil(len / LOREM.length)).slice(0, len));
+  const longClass = (i) => `repro-widget cls-alpha-${i} data-heavy-node-with-a-fairly-long-class-token-${i} state--active variant--primary theme--default`;
+
+  // A widget = ~14 nodes incl. interactive candidates (input/button/a/select/textarea)
+  // + fat attributes + long text. This is what the robust ranker snapshots per candidate.
+  function makeWidget(doc, frameTag, i) {
+    const w = doc.createElement('div');
+    w.className = longClass(i);
+    w.id = `w-${frameTag}-${i}`;
+    for (let a = 0; a < cfg.attrs; a++) {
+      w.setAttribute(`data-repro-attr-${a}`, `val-${frameTag}-${i}-${a}-${pad(24)}`);
+    }
+    w.setAttribute('aria-label', `widget ${i} in ${frameTag} ${pad(40)}`);
+    w.setAttribute('title', pad(60));
+    w.setAttribute('style', 'background:linear-gradient(90deg,#fff,#f6f6f6);border-radius:4px;');
+    w.innerHTML =
+      `<span class="lbl">Widget ${i} — ${pad(cfg.text)}</span>` +
+      `<p class="desc">${pad(cfg.text)}</p>` +
+      `<input type="text" name="in-${frameTag}-${i}" placeholder="${pad(40)}" value="${pad(30)}" />` +
+      `<textarea name="ta-${frameTag}-${i}">${pad(cfg.text)}</textarea>` +
+      `<select name="sel-${frameTag}-${i}">` +
+        Array.from({length: 5}, (_, o) => `<option value="opt-${o}">${pad(20)}</option>`).join('') +
+      `</select>` +
+      `<button type="button" data-action="submit-${i}">Submit ${i} ${pad(20)}</button>` +
+      `<a href="https://example.com/deep/path/${frameTag}/${i}?x=${pad(20)}">link ${i}</a>` +
+      `<div class="nested-a"><div class="nested-b"><span class="nested-c">${pad(40)}</span></div></div>`;
+    return w;
+  }
+
+  // Deep wrapper spine so every widget's xpath / full CSS path is long
+  // (getXPath / getFullCSSPath walk to root — long strings + O(depth) work per candidate).
+  function heavyMount(doc, host) {
+    let node = host;
+    for (let d = 0; d < cfg.spine; d++) {
+      const wrap = doc.createElement('div');
+      wrap.className = `spine spine-lvl-${d} depth-wrapper-with-long-name-${d}`;
+      wrap.setAttribute('data-spine', String(d));
+      node.appendChild(wrap);
+      node = wrap;
+    }
+    return node; // widgets hang here, at the bottom of the spine
+  }
+
+  // Big INCOMPRESSIBLE noise image as a data-URI. Generated once, reused in every
+  // <img src> → fat bytes in the serialized HTML AND real GPU decode/paint memory
+  // when the hundreds of copies are rendered (compositor pressure, not just V8 heap).
+  function makeNoiseDataURI(px) {
+    const c = document.createElement('canvas');
+    c.width = c.height = px;
+    const ctx = c.getContext('2d');
+    const img = ctx.createImageData(px, px);
+    const d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      d[i] = Math.random() * 255; d[i + 1] = Math.random() * 255; d[i + 2] = Math.random() * 255; d[i + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+    const g = ctx.createLinearGradient(0, 0, px, px);
+    g.addColorStop(0, 'rgba(255,0,128,.5)'); g.addColorStop(1, 'rgba(0,160,255,.5)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, px, px);
+    return c.toDataURL('image/png');
+  }
+  const NOISE = cfg.mb > 0 ? makeNoiseDataURI(cfg.imgpx) : '';
+  if (NOISE) console.log(`[repro] noise data-URI = ${(NOISE.length / 1048576).toFixed(2)} MB/image`);
+
+  // Fill each frame up to cfg.mb MB with visually-heavy cards (image + gradients + blur + shadows).
+  function addFiller(doc, host, frameTag) {
+    if (!NOISE) return;
+    const perCard = NOISE.length + 900; // the img src dominates card bytes
+    const count = Math.max(4, Math.ceil((cfg.mb * 1024 * 1024) / perCard));
+    const grid = doc.createElement('div');
+    grid.className = 'vgrid';
+    for (let i = 0; i < count; i++) {
+      const card = doc.createElement('div');
+      card.className = 'vcard';
+      card.setAttribute('data-card', `${frameTag}-${i}`);
+      const h = doc.createElement('h3'); h.textContent = `Card ${i} — ${frameTag}`;
+      const im = doc.createElement('img'); im.alt = `noise ${i}`; im.src = NOISE; // property set: no re-parse of the huge string
+      const p = doc.createElement('p'); p.textContent = pad(cfg.text);
+      const sw = doc.createElement('div'); sw.className = 'swatch';
+      card.append(h, im, p, sw);
+      grid.appendChild(card);
+    }
+    host.appendChild(grid);
+  }
+
+  function fillFrame(doc, host, count, frameTag) {
+    const mount = heavyMount(doc, host);
+    const frag = doc.createDocumentFragment();
+    for (let i = 0; i < count; i++) frag.appendChild(makeWidget(doc, frameTag, i));
+    mount.appendChild(frag);
+    addFiller(doc, mount, frameTag); // pad frame up to cfg.mb MB
+    return mount;
+  }
+
+  // ---- main page ----
+  fillFrame(document, document.getElementById('main-content'), cfg.widgets, 'main');
+
+  // ---- nested iframe chain (srcdoc => same-origin => contentDocument walkable) ----
+  let built = 0;
+  function addLevel(parentDoc, parentMount, level) {
+    if (level > cfg.depth) {
+      finalize(parentDoc, parentMount);
+      return;
+    }
+    const iframe = parentDoc.createElement('iframe');
+    iframe.id = `frame-lvl-${level}`;
+    iframe.setAttribute('data-iframe-level', String(level));
+    iframe.title = `nested iframe level ${level}`;
+    iframe.onload = function () {
+      const d = iframe.contentDocument;
+      const body = d.body || d.documentElement;
+      const mount = fillFrame(d, body, cfg.iwidgets, `f${level}`);
+      built++;
+      document.getElementById('hud-cfg').textContent += `\nbuilt iframe level ${level}/${cfg.depth}`;
+      addLevel(d, mount, level + 1); // recurse deeper
+    };
+    // minimal same-origin document; we fill it from here via contentDocument
+    iframe.srcdoc = '<!doctype html><html><head><meta charset="utf-8"></head><body></body></html>';
+    parentMount.appendChild(iframe);
+  }
+
+  // Drop a clearly-identifiable target at the deepest level so you can aim the
+  // robust algorithm / recorder at "element under N iframes on a huge DOM".
+  function finalize(deepestDoc, deepestMount) {
+    const target = deepestDoc.createElement('button');
+    target.id = 'deep-target';
+    target.type = 'button';
+    target.textContent = 'FIND ME — deepest target';
+    target.setAttribute('data-repro-target', 'true');
+    deepestMount.appendChild(target);
+    const msg = `[repro] done. deep-target is inside ${cfg.depth} nested iframes. ` +
+      `frame chain: ${Array.from({length: cfg.depth}, (_, i) => '#frame-lvl-' + (i + 1)).join(' >>> ')}`;
+    console.log(msg);
+    document.getElementById('hud-cfg').textContent += `\n✅ deep-target ready (@${cfg.depth} iframes)`;
+  }
+
+  if (cfg.depth > 0) addLevel(document, document.getElementById('iframe-mount'), 1);
+  else finalize(document, document.getElementById('main-content'));
+
+  // ---- payload measurement (roughly what a full-DOM walker pays) ----
+  document.getElementById('measure-btn').addEventListener('click', function () {
+    let els = 0, htmlChars = 0, frames = 0, maxXpath = 0;
+    function walk(doc, depth) {
+      frames++;
+      const all = doc.querySelectorAll('*');
+      els += all.length;
+      try { htmlChars += doc.documentElement.outerHTML.length; } catch (e) {}
+      maxXpath = Math.max(maxXpath, depth);
+      doc.querySelectorAll('iframe').forEach((f) => {
+        try { if (f.contentDocument) walk(f.contentDocument, depth + 1); } catch (e) {}
+      });
+    }
+    walk(document, 0);
+    const mb = (htmlChars / (1024 * 1024)).toFixed(1);
+    const out =
+      `frames walked : ${frames}\n` +
+      `elements      : ${els.toLocaleString()}\n` +
+      `serialized HTML: ~${mb} MB (outerHTML sum)\n` +
+      `iframe depth   : ${maxXpath}\n` +
+      `note: robust algo peak ≈ candidates × (outerHTML≤500 + xpath + cssPath + text),\n` +
+      `      so live-heap cost is a multiple of the number above.`;
+    document.getElementById('hud-out').textContent = out;
+    console.log('[repro] measure\n' + out);
+  });
+})();
+</script>
+</body>
+</html>
